@@ -14,10 +14,6 @@ pub fn package(name: []const u8, path: []const u8, comptime conf: PackageConfig)
         .cSrcFiles = if (conf.useBundledSQLite) &.{"c/sqlite3.c"} else &.{},
         .includeDirs = if (conf.useBundledSQLite) &.{"c/"} else &.{},
         .doNotTest = conf.skipTest,
-        .testSrcs = &.{
-            "query.zig",
-            "errors.zig",
-        },
         .linkSystemLibs = if (!conf.useBundledSQLite) &.{"sqlite3"} else &.{},
         .ccflags = &.{"-Wall", "-std=gnu99", "-g"},
         .linkLibC = true,
