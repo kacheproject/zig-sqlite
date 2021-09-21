@@ -1,5 +1,8 @@
 const std = @import("std");
-const build_options = @import("build_options");
+const build_options = .{
+    .in_memory = true,
+    .db_file = null,
+}; // Workaround
 const debug = std.debug;
 const io = std.io;
 const mem = std.mem;
@@ -1113,18 +1116,15 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
 
             inline for (StructTypeInfo.fields) |struct_field, _i| {
                 const bind_marker = query.bind_markers[_i];
-                switch (bind_marker) {
-                    .Typed => |typ| {
-                        const FieldTypeInfo = @typeInfo(struct_field.field_type);
-                        switch (FieldTypeInfo) {
-                            .Struct, .Enum, .Union => comptime assertMarkerType(
-                                if (@hasDecl(struct_field.field_type, "BaseType")) struct_field.field_type.BaseType else struct_field.field_type,
-                                typ,
-                            ),
-                            else => comptime assertMarkerType(struct_field.field_type, typ),
-                        }
-                    },
-                    .Untyped => {},
+                if (bind_marker.typed) |typ| {
+                    const FieldTypeInfo = @typeInfo(struct_field.field_type);
+                    switch (FieldTypeInfo) {
+                        .Struct, .Enum, .Union => comptime assertMarkerType(
+                            if (@hasDecl(struct_field.field_type, "BaseType")) struct_field.field_type.BaseType else struct_field.field_type,
+                            typ,
+                        ),
+                        else => comptime assertMarkerType(struct_field.field_type, typ),
+                    }
                 }
 
                 const field_value = @field(values, struct_field.name);
