@@ -1,0 +1,3 @@
+[submodule "autopkg"]
+	path = autopkg
+	url = https://github.com/kacheproject/autopkg.git
