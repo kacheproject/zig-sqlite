@@ -181,6 +181,15 @@ pub const ParsedQuery = struct {
     pub fn getQuery(comptime self: *const Self) []const u8 {
         return self.query[0..self.query_size];
     }
+
+    pub fn findMarkerByStringId(comptime self: *const Self, comptime strId: []const u8) ?usize {
+        inline for (self.bind_markers[0..self.nb_bind_markers]) |marker, i| {
+            if (marker.identifier) |id| {
+                if (std.mem.eql(u8, id, strId)) return i;
+            }
+        }
+        return null;
+    }
 };
 
 test "parsed query: query" {
