@@ -15,14 +15,15 @@ pub fn package(name: []const u8, path: []const u8, comptime conf: PackageConfig)
         .includeDirs = if (conf.useBundledSQLite) &.{"c/"} else &.{},
         .doNotTest = conf.skipTest,
         .linkSystemLibs = if (!conf.useBundledSQLite) &.{"sqlite3"} else &.{},
-        .ccflags = &.{"-Wall", "-std=gnu99", "-g"},
+        .ccflags = &.{"-Wall", "-std=gnu99", "-g", ""},
         .linkLibC = true,
     });
 }
 
 pub fn build(b: *std.build.Builder) !void {
     const mode = b.standardReleaseOptions();
-    const target = b.standardTargetOptions(.{});
+    var target = b.standardTargetOptions(.{});
+    target.setGnuLibCVersion(2, 28, 0); // sqlite3 requires GNU C Library 2.28 (for fcntl64)
 
     var myPackage = autopkg.accept(package("sqlite", ".", .{
         .skipTest = false,
