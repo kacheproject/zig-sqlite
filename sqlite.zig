@@ -471,8 +471,8 @@ pub const Db = struct {
         break :blk Statement(.{}, ParsedQuery.from(query));
     } {
         @setEvalBranchQuota(100000);
-        const parsed_query = ParsedQuery.from(query);
-        return Statement(.{}, comptime parsed_query).prepare(self, options, 0);
+        const parsed_query = comptime ParsedQuery.from(query);
+        return @bitCast(Statement(.{}, parsed_query), try Statement(.{}, parsed_query).prepare(self, options, 0));
     }
 
     /// prepare prepares a statement for the `query` provided.
@@ -494,8 +494,8 @@ pub const Db = struct {
         break :blk Statement(.{}, ParsedQuery.from(query));
     } {
         @setEvalBranchQuota(100000);
-        const parsed_query = ParsedQuery.from(query);
-        return Statement(.{}, comptime parsed_query).prepare(self, .{}, 0);
+        const parsed_query = comptime ParsedQuery.from(query);
+        return @bitCast(Statement(.{}, parsed_query), try Statement(.{}, parsed_query).prepare(self, .{}, 0));
     }
 
     /// rowsAffected returns the number of rows affected by the last statement executed.
