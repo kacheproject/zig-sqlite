@@ -451,6 +451,13 @@ pub const Db = struct {
         try stmt.exec(options, values);
     }
 
+    /// exec2 is a convenience function which prepares a statement and executes it directly.
+    pub fn exec2(self: *Self, comptime query: []const u8, options: QueryOptions, values: anytype) !void {
+        var stmt = try self.prepareWithDiags(query, options);
+        defer stmt.deinit();
+        try stmt.exec2(options, values);
+    }
+
     /// one is a convenience function which prepares a statement and reads a single row from the result set.
     pub fn one(self: *Self, comptime Type: type, comptime query: []const u8, options: QueryOptions, values: anytype) !?Type {
         var stmt = try self.prepareWithDiags(query, options);
@@ -458,11 +465,25 @@ pub const Db = struct {
         return try stmt.one(Type, options, values);
     }
 
+    /// one2 is a convenience function which prepares a statement and reads a single row from the result set.
+    pub fn one2(self: *Self, comptime Type: type, comptime query: []const u8, options: QueryOptions, values: anytype) !?Type {
+        var stmt = try self.prepareWithDiags(query, options);
+        defer stmt.deinit();
+        return try stmt.one2(Type, options, values);
+    }
+
     /// oneAlloc is like `one` but can allocate memory.
     pub fn oneAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, comptime query: []const u8, options: QueryOptions, values: anytype) !?Type {
         var stmt = try self.prepareWithDiags(query, options);
         defer stmt.deinit();
         return try stmt.oneAlloc(Type, allocator, options, values);
+    }
+
+    /// oneAlloc2 is like `one2` but can allocate memory.
+    pub fn oneAlloc2(self: *Self, comptime Type: type, allocator: *mem.Allocator, comptime query: []const u8, options: QueryOptions, values: anytype) !?Type {
+        var stmt = try self.prepareWithDiags(query, options);
+        defer stmt.deinit();
+        return try stmt.oneAlloc2(Type, allocator, options, values);
     }
 
     /// prepareWithDiags is like `prepare` but takes an additional options argument.
@@ -1099,6 +1120,7 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
         ///     name: Text,
         ///     age: u32
         ///   }
+        /// The order of fields will be used to bind values. Please use `.bindStruct` if you want to use host parameter names.
         ///
         /// The types are checked at comptime.
         fn bind(self: *Self, values: anytype) void {
@@ -1128,6 +1150,73 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
                 const field_value = @field(values, struct_field.name);
 
                 self.bindField(struct_field.field_type, struct_field.name, _i, field_value);
+            }
+        }
+
+        /// bind binding values to every bind markers with same name.
+        ///
+        /// The `values` variable must be a struct where each field has the type of the corresponding bind marker.
+        /// For example this query:
+        ///   SELECT 1 FROM user WHERE name = ?name{text} AND age < ?age{u32}
+        ///
+        /// Has two bind markers, so `values` must have at least the following fields:
+        ///   struct {
+        ///     age: u32,
+        ///     name: u32
+        ///   }
+        /// The order in the structure does not matter due the identification using field name.
+        /// To use the order instead of the field names, use `.bind`.
+        ///
+        /// The types are checked at comptime.
+        fn bindStruct(self: *Self, values: anytype) void {
+            const StructType = @TypeOf(values);
+            const StructTypeInfo = @typeInfo(StructType).Struct;
+
+            if (comptime query.nb_bind_markers != StructTypeInfo.fields.len) {
+                @compileError(comptime std.fmt.comptimePrint("number of bind markers ({d}) not equal to number of fields ({d})", .{
+                    query.nb_bind_markers,
+                    StructTypeInfo.fields.len,
+                }));
+            }
+
+            inline for (query.bind_markers[0..query.nb_bind_markers]) |*bindMarker| {
+                const found: bool = searchField: {
+                    inline for (StructTypeInfo.fields) |struct_field| {
+                        if (bindMarker.identifier) |markerId| {
+                            if (std.mem.eql(u8, markerId, struct_field.name)) {
+                                if (bindMarker.typed) |typ| {
+                                    const FieldTypeInfo = @typeInfo(struct_field.field_type);
+                                    switch (FieldTypeInfo) {
+                                        .Struct, .Enum, .Union => comptime assertMarkerType(
+                                            if (@hasDecl(struct_field.field_type, "BaseType")) struct_field.field_type.BaseType else struct_field.field_type,
+                                            typ,
+                                        ),
+                                        else => comptime assertMarkerType(struct_field.field_type, typ),
+                                    }
+                                }
+                                break :searchField true;
+                            }
+                        } else {
+                            @compileError("bindStruct() does not support bind markers without host parameter name");
+                        }
+                    }
+                    break :searchField false;
+                };
+                if (!found) {
+                    @compileError(comptime std.fmt.comptimePrint("field \"{s}\" not found in structure.", .{bindMarker.identifier}));
+                }
+            }
+
+            inline for (StructTypeInfo.fields) |struct_field| {
+                const pindex = c.sqlite3_bind_parameter_index(self.stmt, std.fmt.comptimePrint("{s}", .{struct_field.name}));
+                if (pindex != 0) {
+                    self.bindField(
+                        struct_field.field_type,
+                        struct_field.name,
+                        pindex-1, // .bindField uses 0-based since sqlite3 uses 1-based index
+                        @field(values, struct_field.name),
+                    );
+                } else unreachable; // It's impossible to have non-exists name.
             }
         }
 
@@ -1189,6 +1278,18 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
             }
         }
 
+        fn smartBind(self: *Self, values: anytype) void {
+            if (std.meta.fieldNames(@TypeOf(values)).len == 0){
+                if (query.nb_bind_markers > 0) {
+                    @compileError(std.fmt.comptimePrint("query expect {} parameter(s)", .{query.nb_bind_markers}));
+                }
+            } else if (std.meta.trait.isTuple(@TypeOf(values))){
+                self.bind(values);
+            } else {
+                self.bindStruct(values);
+            }
+        }
+
         /// exec executes a statement which does not return data.
         ///
         /// The `options` tuple is used to provide additional state in some cases.
@@ -1198,6 +1299,29 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
         ///
         pub fn exec(self: *Self, options: QueryOptions, values: anytype) !void {
             self.bind(values);
+
+            var dummy_diags = Diagnostics{};
+            var diags = options.diags orelse &dummy_diags;
+
+            const result = c.sqlite3_step(self.stmt);
+            switch (result) {
+                c.SQLITE_DONE => {},
+                else => {
+                    diags.err = getLastDetailedErrorFromDb(self.db);
+                    return errors.errorFromResultCode(result);
+                },
+            }
+        }
+
+        /// exec executes a statement which does not return data.
+        ///
+        /// The `options` tuple is used to provide additional state in some cases.
+        ///
+        /// The `values` variable is used for the bind parameters. It must have as many fields as there are bind markers
+        /// in the input query string. The values will be binded depends order in tuple, or names in normal structure.
+        ///
+        pub fn exec2(self: *Self, options: QueryOptions, values: anytype) !void {
+            self.smartBind(values);
 
             var dummy_diags = Diagnostics{};
             var diags = options.diags orelse &dummy_diags;
@@ -1240,6 +1364,34 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
             return res;
         }
 
+        /// iterator returns an iterator to read data from the result set, one row at a time.
+        ///
+        /// The data in the row is used to populate a value of the type `Type`.
+        /// This means that `Type` must have as many fields as is returned in the query
+        /// executed by this statement.
+        /// This also means that the type of each field must be compatible with the SQLite type.
+        ///
+        /// Here is an example of how to use the iterator:
+        ///
+        ///     var iter = try stmt.iterator(usize, .{});
+        ///     while (try iter.next(.{})) |row| {
+        ///         ...
+        ///     }
+        ///
+        /// The `values` tuple is used for the bind parameters. It must have as many fields as there are bind markers
+        /// in the input query string. The values will be binded depends order in tuple, or names in normal structure.
+        ///
+        /// The iterator _must not_ outlive the statement.
+        pub fn iterator2(self: *Self, comptime Type: type, values: anytype) !Iterator(Type) {
+            self.smartBind(values);
+
+            var res: Iterator(Type) = undefined;
+            res.db = self.db;
+            res.stmt = self.stmt;
+
+            return res;
+        }
+
         /// one reads a single row from the result set of this statement.
         ///
         /// The data in the row is used to populate a value of the type `Type`.
@@ -1272,9 +1424,49 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
             return row;
         }
 
+        /// one reads a single row from the result set of this statement.
+        ///
+        /// The data in the row is used to populate a value of the type `Type`.
+        /// This means that `Type` must have as many fields as is returned in the query
+        /// executed by this statement.
+        /// This also means that the type of each field must be compatible with the SQLite type.
+        ///
+        /// Here is an example of how to use an anonymous struct type:
+        ///
+        ///     const row = try stmt.one2(
+        ///         struct {
+        ///             id: usize,
+        ///             name: [400]u8,
+        ///             age: usize,
+        ///         },
+        ///         .{},
+        ///         .{ .foo = "bar", .age = 500 },
+        ///     );
+        ///
+        /// The `options` tuple is used to provide additional state in some cases.
+        ///
+        /// The `values` tuple is used for the bind parameters. It must have as many fields as there are bind markers
+        /// in the input query string. The values will be binded depends order in tuple, or names in normal structure.
+        ///
+        /// This cannot allocate memory. If you need to read TEXT or BLOB columns you need to use arrays or alternatively call `oneAlloc`.
+        pub fn one2(self: *Self, comptime Type: type, options: QueryOptions, values: anytype) !?Type {
+            var iter = try self.iterator2(Type, values);
+
+            const row = (try iter.next(options)) orelse return null;
+            return row;
+        }
+
         /// oneAlloc is like `one` but can allocate memory.
         pub fn oneAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, values: anytype) !?Type {
             var iter = try self.iterator(Type, values);
+
+            const row = (try iter.nextAlloc(allocator, options)) orelse return null;
+            return row;
+        }
+
+        /// oneAlloc is like `one2` but can allocate memory.
+        pub fn oneAlloc2(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, values: anytype) !?Type {
+            var iter = try self.iterator2(Type, values);
 
             const row = (try iter.nextAlloc(allocator, options)) orelse return null;
             return row;
@@ -1308,6 +1500,43 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
         /// Note that this allocates all rows into a single slice: if you read a lot of data this can use a lot of memory.
         pub fn all(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, values: anytype) ![]Type {
             var iter = try self.iterator(Type, values);
+
+            var rows = std.ArrayList(Type).init(allocator);
+            while (try iter.nextAlloc(allocator, options)) |row| {
+                try rows.append(row);
+            }
+
+            return rows.toOwnedSlice();
+        }
+
+        /// all reads all rows from the result set of this statement.
+        ///
+        /// The data in each row is used to populate a value of the type `Type`.
+        /// This means that `Type` must have as many fields as is returned in the query
+        /// executed by this statement.
+        /// This also means that the type of each field must be compatible with the SQLite type.
+        ///
+        /// Here is an example of how to use an anonymous struct type:
+        ///
+        ///     const rows = try stmt.all2(
+        ///         struct {
+        ///             id: usize,
+        ///             name: []const u8,
+        ///             age: usize,
+        ///         },
+        ///         allocator,
+        ///         .{},
+        ///         .{ .foo = "bar", .age = 500 },
+        ///     );
+        ///
+        /// The `options` tuple is used to provide additional state in some cases.
+        ///
+        /// The `values` tuple is used for the bind parameters. It must have as many fields as there are bind markers
+        /// in the input query string. The values will be binded depends order in tuple, or names in normal structure.
+        ///
+        /// Note that this allocates all rows into a single slice: if you read a lot of data this can use a lot of memory.
+        pub fn all2(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, values: anytype) ![]Type {
+            var iter = try self.iterator2(Type, values);
 
             var rows = std.ArrayList(Type).init(allocator);
             while (try iter.nextAlloc(allocator, options)) |row| {
@@ -1460,6 +1689,29 @@ test "sqlite: statement exec" {
     // Test with a Text struct
     {
         try db.exec("INSERT INTO user(id, name, age) VALUES(?{usize}, ?{text}, ?{u32})", .{}, .{
+            .id = @as(usize, 201),
+            .name = Text{ .data = "hello" },
+            .age = @as(u32, 20),
+        });
+    }
+}
+
+test "sqlite: statement exec2" {
+    var db = try getTestDb();
+    try addTestData(&db);
+
+    // Test with a Blob struct
+    {
+        try db.exec2("INSERT INTO user(id, name, age) VALUES(?{usize}, ?{blob}, ?{u32})", .{}, .{
+            @as(usize, 200),
+            Blob{ .data = "hello" },
+            @as(u32, 20),
+        });
+    }
+
+    // Test with a Text struct
+    {
+        try db.exec2("INSERT INTO user(id, name, age) VALUES(?id{usize}, ?name{text}, ?age{u32})", .{}, .{
             .id = @as(usize, 201),
             .name = Text{ .data = "hello" },
             .age = @as(u32, 20),
