@@ -1,5 +1,9 @@
 const std = @import("std");
-const build_options = @import("build_options");
+const builtin = @import("builtin");
+const build_options = .{
+     .in_memory = true,
+     .db_file = null,
+}; // Workaround. TODO: support build_options for old compilers in autopkg.
 const debug = std.debug;
 const io = std.io;
 const mem = std.mem;
