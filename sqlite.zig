@@ -1301,7 +1301,7 @@ pub const DynamicStatement = struct {
     /// Possible errors:
     /// - SQLiteError.SQLiteNotFound if some fields not found
     pub fn iterator(self: *Self, comptime Type: type, values: anytype) !Iterator(Type) {
-        try self.smartBind(values);
+        try self.smartBind(.{}, values);
 
         var res: Iterator(Type) = undefined;
         res.db = self.db;
