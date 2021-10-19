@@ -395,11 +395,11 @@ pub const Db = struct {
         return getLastDetailedErrorFromDb(self.db);
     }
 
-    fn getPragmaQuery(comptime buf: []u8, comptime name: []const u8, comptime arg: ?[]const u8) []const u8 {
+    fn getPragmaQuery(comptime name: []const u8, comptime arg: ?[]const u8) []const u8 {
         if (arg) |a| {
-            return try std.fmt.bufPrint(buf, "PRAGMA {s} = {s}", .{ name, a });
+            return std.fmt.comptimePrint("PRAGMA {s} = {s}", .{ name, a });
         }
-        return try std.fmt.bufPrint(buf, "PRAGMA {s}", .{name});
+        return std.fmt.comptimePrint("PRAGMA {s}", .{name});
     }
 
     /// getLastInsertRowID returns the last inserted rowid.
@@ -415,8 +415,7 @@ pub const Db = struct {
     ///     const journal_mode = try db.pragma([]const u8, allocator, .{}, "journal_mode", null);
     ///
     pub fn pragmaAlloc(self: *Self, comptime Type: type, allocator: *mem.Allocator, options: QueryOptions, comptime name: []const u8, comptime arg: ?[]const u8) !?Type {
-        comptime var buf: [1024]u8 = undefined;
-        comptime var query = getPragmaQuery(&buf, name, arg);
+        comptime var query = getPragmaQuery(name, arg);
 
         var stmt = try self.prepare(query);
         defer stmt.deinit();
@@ -438,8 +437,7 @@ pub const Db = struct {
     ///
     /// This cannot allocate memory. If your pragma command returns text you must use an array or call `pragmaAlloc`.
     pub fn pragma(self: *Self, comptime Type: type, options: QueryOptions, comptime name: []const u8, comptime arg: ?[]const u8) !?Type {
-        comptime var buf: [1024]u8 = undefined;
-        comptime var query = getPragmaQuery(&buf, name, arg);
+        comptime var query = getPragmaQuery(name, arg);
 
         var stmt = try self.prepareWithDiags(query, options);
         defer stmt.deinit();
@@ -1048,38 +1046,38 @@ pub fn StatementType(comptime opts: StatementOptions, comptime query: []const u8
 
 pub const StatementOptions = struct {};
 
-/// DynamicStatement represents a statement in sqlite3. It almost works like sqlite3_stmt.
-/// The difference to `Statement` is that this structure comes without addtional comptime type-checking.
-/// 
-/// The structure supports "host parameter names", which used in query to identify bind marker:
-/// ````
-///   SELECT email FROM users WHERE name = @name AND password = $password;
-/// ````
-/// 
-/// To use these names, pass a normal structure instead of a tuple. Set `stmt` is the related `DynamicStatement`:
-/// ````
-///   try stmt.one(.{
-///     .name = "Tankman", .password = "Passw0rd",
-///   })
-/// ````
+/// DynamicStatement is a wrapper around a SQLite statement, providing high-level functions to execute
+/// a statement and retrieve rows for SELECT queries.
 ///
-/// It doesn't matter "@", "$" or ":" is being used, the one will be automatically chosen,
-/// but it's not recommended to mix them up, because: sqlite3 thinks @A, $A and :A are
-/// different, but `DynamicStatement` will try :A, @A, $A in order when you passing a 'A' field.
-/// The ":A" will be binded while "@A", "$A" are left behind.
-/// TL;DR: don't use same name with different prefix ("@", "$", ":").
+/// The difference to `Statement` is that this type isn't bound to a single parsed query and can execute any query.
 ///
-/// You can use unnamed markers with tuple:
-/// ````
-///   SELECT email FROM users WHERE name = ? AND password = ?;
-/// ````
-/// 
-/// ````
-///   try stmt.one(.{"Tankman", "Passw0rd"});
-/// ````
+/// `DynamicStatement` supports "host parameter names", which can be used in a query to identify a bind marker:
 ///
+///     SELECT email FROM users WHERE name = @name AND password = $password;
+///
+/// You can read more about these parameters in the sqlite documentation: https://sqlite.org/c3ref/bind_blob.html
+///
+/// To use these names use an anonymous struct with corresponding names like this:
+///
+///     const stmt = "SELECT * FROM users WHERE name = @name AND password = @pasdword";
+///     const row = try stmt.one(Row, .{
+///         .name = "Tankman",
+///         .password = "Passw0rd",
+///     });
+///
+/// This works regardless of the prefix you used in the query.
+/// While using the same name with a different prefix is supported by sqlite, `DynamicStatement` doesn't support
+/// it because we can't have multiple fields in a struct with the same name.
+///
+/// You can also use unnamed markers with a tuple:
+///
+///     const stmt = "SELECT email FROM users WHERE name = ? AND password = ?";
+///     const row = try stmt.one(Row, .{"Tankman", "Passw0rd"});
+///
+/// TODO(vincent): clarify the following
 /// Named and unnamed markers could not be mixed, functions might be failed in slient.
 /// (Just like sqlite3's sqlite3_stmt, the unbinded values will be treated as NULL.)
+///
 pub const DynamicStatement = struct {
     db: *c.sqlite3,
     stmt: *c.sqlite3_stmt,
@@ -1136,17 +1134,9 @@ pub const DynamicStatement = struct {
         }
     }
 
-    fn translateError(value: anytype) !void {
-        if (@TypeOf(value) != void) {
-            if (@typeInfo(@TypeOf(value)) == .ErrorUnion and @typeInfo(@TypeOf(value)).ErrorUnion.payload == void) {
-                return value;
-            } else if (@TypeOf(value) == c_int and value == c.SQLITE_OK) {
-                return;
-            } else {
-                return errors.errorFromResultCode(value);
-            }
-        } else {
-            return;
+    fn convertResultToError(result: c_int) !void {
+        if (result != c.SQLITE_OK) {
+            return errors.errorFromResultCode(result);
         }
     }
 
@@ -1154,53 +1144,79 @@ pub const DynamicStatement = struct {
         const field_type_info = @typeInfo(FieldType);
         const column = i + 1;
 
-        const val = switch (FieldType) {
-            Text => c.sqlite3_bind_text(self.stmt, column, field.data.ptr, @intCast(c_int, field.data.len), null),
-            Blob => c.sqlite3_bind_blob(self.stmt, column, field.data.ptr, @intCast(c_int, field.data.len), null),
-            ZeroBlob => c.sqlite3_bind_zeroblob64(self.stmt, column, field.length),
+        switch (FieldType) {
+            Text => {
+                const result = c.sqlite3_bind_text(self.stmt, column, field.data.ptr, @intCast(c_int, field.data.len), null);
+                return convertResultToError(result);
+            },
+            Blob => {
+                const result = c.sqlite3_bind_blob(self.stmt, column, field.data.ptr, @intCast(c_int, field.data.len), null);
+                return convertResultToError(result);
+            },
+            ZeroBlob => {
+                const result = c.sqlite3_bind_zeroblob64(self.stmt, column, field.length);
+                return convertResultToError(result);
+            },
             else => switch (field_type_info) {
-                .Int, .ComptimeInt => c.sqlite3_bind_int64(self.stmt, column, @intCast(c_longlong, field)),
-                .Float, .ComptimeFloat => c.sqlite3_bind_double(self.stmt, column, field),
-                .Bool => c.sqlite3_bind_int64(self.stmt, column, @boolToInt(field)),
+                .Int, .ComptimeInt => {
+                    const result = c.sqlite3_bind_int64(self.stmt, column, @intCast(c_longlong, field));
+                    return convertResultToError(result);
+                },
+                .Float, .ComptimeFloat => {
+                    const result = c.sqlite3_bind_double(self.stmt, column, field);
+                    return convertResultToError(result);
+                },
+                .Bool => {
+                    const result = c.sqlite3_bind_int64(self.stmt, column, @boolToInt(field));
+                    return convertResultToError(result);
+                },
                 .Pointer => |ptr| switch (ptr.size) {
-                    .One => self.bindField(ptr.child, options, field_name, i, field.*),
+                    .One => {
+                        try self.bindField(ptr.child, options, field_name, i, field.*);
+                    },
                     .Slice => switch (ptr.child) {
-                        u8 => c.sqlite3_bind_text(self.stmt, column, field.ptr, @intCast(c_int, field.len), null),
+                        u8 => {
+                            const result = c.sqlite3_bind_text(self.stmt, column, field.ptr, @intCast(c_int, field.len), null);
+                            return convertResultToError(result);
+                        },
                         else => @compileError("cannot bind field " ++ field_name ++ " of type " ++ @typeName(FieldType)),
                     },
                     else => @compileError("cannot bind field " ++ field_name ++ " of type " ++ @typeName(FieldType)),
                 },
                 .Array => |arr| switch (arr.child) {
-                    u8 => u8arr: {
+                    u8 => {
                         const data: []const u8 = field[0..field.len];
 
-                        break :u8arr c.sqlite3_bind_text(self.stmt, column, data.ptr, @intCast(c_int, data.len), null);
+                        const result = c.sqlite3_bind_text(self.stmt, column, data.ptr, @intCast(c_int, data.len), null);
+                        return convertResultToError(result);
                     },
                     else => @compileError("cannot bind field " ++ field_name ++ " of type array of " ++ @typeName(arr.child)),
                 },
                 .Optional => |opt| if (field) |non_null_field| {
-                    return try self.bindField(opt.child, options, field_name, i, non_null_field);
-                } else optional_null: {
-                    break :optional_null c.sqlite3_bind_null(self.stmt, column);
+                    try self.bindField(opt.child, options, field_name, i, non_null_field);
+                } else {
+                    const result = c.sqlite3_bind_null(self.stmt, column);
+                    return convertResultToError(result);
                 },
-                .Null => c.sqlite3_bind_null(self.stmt, column),
+                .Null => {
+                    const result = c.sqlite3_bind_null(self.stmt, column);
+                    return convertResultToError(result);
+                },
                 .Enum => {
                     if (comptime std.meta.trait.isZigString(FieldType.BaseType)) {
-                        return try self.bindField(FieldType.BaseType, options, field_name, i, @tagName(field));
+                        try self.bindField(FieldType.BaseType, options, field_name, i, @tagName(field));
                     } else if (@typeInfo(FieldType.BaseType) == .Int) {
-                        return try self.bindField(FieldType.BaseType, options, field_name, i, @enumToInt(field));
+                        try self.bindField(FieldType.BaseType, options, field_name, i, @enumToInt(field));
+                    } else {
+                        @compileError("enum column " ++ @typeName(FieldType) ++ " must have a BaseType of either string or int to bind");
                     }
-                    // Above if-else tree should have return to bypass @compileError below.
-                    @compileError("enum column " ++ @typeName(FieldType) ++ " must have a BaseType of either string or int to bind");
                 },
                 .Struct => {
-                    return try self.bindField(FieldType.BaseType, options, field_name, i, try field.bindField(options.allocator));
+                    try self.bindField(FieldType.BaseType, options, field_name, i, try field.bindField(options.allocator));
                 },
                 else => @compileError("cannot bind field " ++ field_name ++ " of type " ++ @typeName(FieldType)),
             },
-        };
-
-        return translateError(val);
+        }
     }
 
     fn bind(self: *Self, options: anytype, values: anytype) !void {
@@ -1215,7 +1231,7 @@ pub const DynamicStatement = struct {
 
     fn sqlite3BindParameterIndex(stmt: *c.sqlite3_stmt, comptime name: []const u8) c_int {
         inline for (.{ ":", "@", "$" }) |prefix| {
-            const id = std.fmt.comptimePrint(prefix ++ "{s}", .{name});
+            const id = prefix ++ name;
             const i = c.sqlite3_bind_parameter_index(stmt, id);
             if (i > 0) return i - 1; // .bindField uses 0-based while sqlite3 uses 1-based index.
         }
@@ -1427,16 +1443,16 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
     return struct {
         const Self = @This();
 
-        dynamicStmt: DynamicStatement,
+        dynamic_stmt: DynamicStatement,
 
         fn prepare(db: *Db, options: QueryOptions, flags: c_uint) !Self {
             return Self{
-                .dynamicStmt = try DynamicStatement.prepare(db, query.getQuery(), options, flags),
+                .dynamic_stmt = try DynamicStatement.prepare(db, query.getQuery(), options, flags),
             };
         }
 
         pub fn dynamic(self: *Self) *DynamicStatement {
-            return &self.dynamicStmt;
+            return &self.dynamic_stmt;
         }
 
         /// deinit releases the prepared statement.
@@ -1477,19 +1493,15 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: ParsedQuery) t
 
             inline for (StructTypeInfo.fields) |struct_field, _i| {
                 const bind_marker = query.bind_markers[_i];
-                switch (bind_marker) {
-                    .Typed => |typ| {
-                        const FieldTypeInfo = @typeInfo(struct_field.field_type);
-                        switch (FieldTypeInfo) {
-                            .Struct, .Enum, .Union => comptime assertMarkerType(
-                                if (@hasDecl(struct_field.field_type, "BaseType")) struct_field.field_type.BaseType else struct_field.field_type,
-                                typ,
-                            ),
-                            else => comptime assertMarkerType(struct_field.field_type, typ),
-                        }
-                    },
-
-                    .Untyped => {},
+                if (bind_marker.typed) |typ| {
+                    const FieldTypeInfo = @typeInfo(struct_field.field_type);
+                    switch (FieldTypeInfo) {
+                        .Struct, .Enum, .Union => comptime assertMarkerType(
+                            if (@hasDecl(struct_field.field_type, "BaseType")) struct_field.field_type.BaseType else struct_field.field_type,
+                            typ,
+                        ),
+                        else => comptime assertMarkerType(struct_field.field_type, typ),
+                    }
                 }
             }
 

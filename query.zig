@@ -7,9 +7,15 @@ const Blob = @import("sqlite.zig").Blob;
 /// Text is used to represent a SQLite TEXT value when binding a parameter or reading a column.
 pub const Text = struct { data: []const u8 };
 
-const BindMarker = union(enum) {
-    Typed: type,
-    Untyped: void,
+const BindMarker = struct {
+    typed: ?type = null, // null == untyped
+    identifier: ?[]const u8 = null,
+    id_type: IdType = .Integer,
+
+    pub const IdType = enum {
+        Integer,
+        String,
+    };
 };
 
 pub const ParsedQuery = struct {
@@ -29,13 +35,20 @@ pub const ParsedQuery = struct {
         comptime var current_bind_marker_type: [256]u8 = undefined;
         comptime var current_bind_marker_type_pos = 0;
 
+        comptime var current_bind_marker_id: [256]u8 = undefined;
+        comptime var current_bind_marker_id_pos = 0;
+
         comptime var parsed_query: ParsedQuery = undefined;
         parsed_query.nb_bind_markers = 0;
 
         inline for (query) |c| {
             switch (state) {
                 .Start => switch (c) {
-                    '?' => {
+                    '?', ':', '@', '$' => {
+                        parsed_query.bind_markers[parsed_query.nb_bind_markers] = BindMarker{};
+                        current_bind_marker_type_pos = 0;
+                        current_bind_marker_id_pos = 0;
+                        parsed_query.bind_markers[parsed_query.nb_bind_markers].id_type = if (c == '?') .Integer else .String;
                         state = .BindMarker;
                         buf[pos] = c;
                         pos += 1;
@@ -46,17 +59,47 @@ pub const ParsedQuery = struct {
                     },
                 },
                 .BindMarker => switch (c) {
+                    '?', ':', '@', '$' => @compileError("unregconised multiple '?', ':', '$' or '@'."),
+                    '{' => {
+                        state = .BindMarkerType;
+                    },
+                    else => {
+                        if (std.ascii.isAlpha(c) or std.ascii.isDigit(c)) {
+                            state = .BindMarkerIdentifier;
+                            current_bind_marker_id[current_bind_marker_id_pos] = c;
+                            current_bind_marker_id_pos += 1;
+                        } else {
+                            // This is a bind marker without a type.
+                            state = .Start;
+
+                            parsed_query.bind_markers[parsed_query.nb_bind_markers].typed = null;
+                            parsed_query.nb_bind_markers += 1;
+                        }
+                        buf[pos] = c;
+                        pos += 1;
+                    },
+                },
+                .BindMarkerIdentifier => switch (c) {
+                    '?', ':', '@', '$' => @compileError("unregconised multiple '?', ':', '$' or '@'."),
                     '{' => {
                         state = .BindMarkerType;
                         current_bind_marker_type_pos = 0;
+
+                        // A bind marker with id and type: ?AAA{[]const u8}, we don't need move the pointer.
+                        if (current_bind_marker_id_pos > 0) {
+                            parsed_query.bind_markers[parsed_query.nb_bind_markers].identifier = std.fmt.comptimePrint("{s}", .{current_bind_marker_id[0..current_bind_marker_id_pos]});
+                        }
                     },
                     else => {
-                        // This is a bind marker without a type.
-                        state = .Start;
-
-                        parsed_query.bind_markers[parsed_query.nb_bind_markers] = BindMarker{ .Untyped = {} };
-                        parsed_query.nb_bind_markers += 1;
-
+                        if (std.ascii.isAlpha(c) or std.ascii.isDigit(c)) {
+                            current_bind_marker_id[current_bind_marker_id_pos] = c;
+                            current_bind_marker_id_pos += 1;
+                        } else {
+                            state = .Start;
+                            if (current_bind_marker_id_pos > 0) {
+                                parsed_query.bind_markers[parsed_query.nb_bind_markers].identifier = std.fmt.comptimePrint("{s}", .{current_bind_marker_id[0..current_bind_marker_id_pos]});
+                            }
+                        }
                         buf[pos] = c;
                         pos += 1;
                     },
@@ -67,7 +110,7 @@ pub const ParsedQuery = struct {
 
                         const typ = parseType(current_bind_marker_type[0..current_bind_marker_type_pos]);
 
-                        parsed_query.bind_markers[parsed_query.nb_bind_markers] = BindMarker{ .Typed = typ };
+                        parsed_query.bind_markers[parsed_query.nb_bind_markers].typed = typ;
                         parsed_query.nb_bind_markers += 1;
                     },
                     else => {
@@ -83,11 +126,12 @@ pub const ParsedQuery = struct {
 
         // The last character was ? so this must be an untyped bind marker.
         if (state == .BindMarker) {
-            parsed_query.bind_markers[parsed_query.nb_bind_markers] = BindMarker{ .Untyped = {} };
+            parsed_query.bind_markers[parsed_query.nb_bind_markers].typed = null;
             parsed_query.nb_bind_markers += 1;
-        }
-
-        if (state == .BindMarkerType) {
+        } else if (state == .BindMarkerIdentifier) {
+            parsed_query.bind_markers[parsed_query.nb_bind_markers].identifier = std.fmt.comptimePrint("{s}", .{current_bind_marker_id[0..current_bind_marker_id_pos]});
+            parsed_query.nb_bind_markers += 1;
+        } else if (state == .BindMarkerType) {
             @compileError("invalid final state " ++ @tagName(state) ++ ", this means you wrote an incomplete bind marker type");
         }
 
@@ -175,19 +219,19 @@ test "parsed query: bind markers types" {
     const testCases = &[_]testCase{
         .{
             .query = "foobar ?{usize}",
-            .expected_marker = .{ .Typed = usize },
+            .expected_marker = .{ .typed = usize },
         },
         .{
             .query = "foobar ?{text}",
-            .expected_marker = .{ .Typed = Text },
+            .expected_marker = .{ .typed = Text },
         },
         .{
             .query = "foobar ?{blob}",
-            .expected_marker = .{ .Typed = Blob },
+            .expected_marker = .{ .typed = Blob },
         },
         .{
             .query = "foobar ?",
-            .expected_marker = .{ .Untyped = {} },
+            .expected_marker = .{ .typed = null },
         },
     };
 
@@ -197,9 +241,101 @@ test "parsed query: bind markers types" {
         try testing.expectEqual(1, parsed_query.nb_bind_markers);
 
         const bind_marker = parsed_query.bind_markers[0];
-        switch (tc.expected_marker) {
-            .Typed => |typ| try testing.expectEqual(typ, bind_marker.Typed),
-            .Untyped => |typ| try testing.expectEqual(typ, bind_marker.Untyped),
-        }
+        try testing.expectEqual(tc.expected_marker.typed, bind_marker.typed);
+    }
+}
+
+test "parsed query: bind markers identifier" {
+    const testCase = struct {
+        query: []const u8,
+        expected_marker: BindMarker,
+    };
+
+    const testCases = &[_]testCase{
+        .{
+            .query = "foobar @ABC{usize}",
+            .expected_marker = .{ .identifier = "ABC" },
+        },
+        .{
+            .query = "foobar ?123{text}",
+            .expected_marker = .{ .identifier = "123" },
+        },
+        .{
+            .query = "foobar $abc{blob}",
+            .expected_marker = .{ .identifier = "abc" },
+        },
+        .{
+            .query = "foobar ?123",
+            .expected_marker = .{ .identifier = "123" },
+        },
+    };
+
+    inline for (testCases) |tc| {
+        comptime var parsed_query = ParsedQuery.from(tc.query);
+
+        try testing.expectEqual(@as(usize, 1), parsed_query.nb_bind_markers);
+
+        const bind_marker = parsed_query.bind_markers[0];
+        try testing.expectEqualStrings(tc.expected_marker.identifier.?, bind_marker.identifier.?);
+    }
+}
+
+test "parsed query: query bind identifier" {
+    const testCase = struct {
+        query: []const u8,
+        expected_query: []const u8,
+    };
+
+    const testCases = &[_]testCase{
+        .{
+            .query = "INSERT INTO user(id, name, age) VALUES(@id{usize}, :name{[]const u8}, $age{u32})",
+            .expected_query = "INSERT INTO user(id, name, age) VALUES(@id, :name, $age)",
+        },
+        .{
+            .query = "SELECT id, name, age FROM user WHER age > :ageGT{u32} AND age < @ageLT{u32}",
+            .expected_query = "SELECT id, name, age FROM user WHER age > :ageGT AND age < @ageLT",
+        },
+        .{
+            .query = "SELECT id, name, age FROM user WHER age > :ageGT AND age < $ageLT",
+            .expected_query = "SELECT id, name, age FROM user WHER age > :ageGT AND age < $ageLT",
+        },
+    };
+
+    inline for (testCases) |tc| {
+        comptime var parsed_query = ParsedQuery.from(tc.query);
+        try testing.expectEqualStrings(tc.expected_query, parsed_query.getQuery());
+    }
+}
+
+test "parsed query: bind markers identifier type" {
+    const testCase = struct {
+        query: []const u8,
+        expected_marker: BindMarker,
+    };
+
+    const testCases = &[_]testCase{ .{
+        .query = "foobar @ABC{usize}",
+        .expected_marker = .{ .id_type = .String },
+    }, .{
+        .query = "foobar ?123{text}",
+        .expected_marker = .{ .id_type = .Integer },
+    }, .{
+        .query = "foobar $abc{blob}",
+        .expected_marker = .{ .id_type = .String },
+    }, .{
+        .query = "foobar ?123",
+        .expected_marker = .{ .id_type = .Integer },
+    }, .{
+        .query = "foobar :abc",
+        .expected_marker = .{ .id_type = .String },
+    } };
+
+    inline for (testCases) |tc| {
+        comptime var parsed_query = ParsedQuery.from(tc.query);
+
+        try testing.expectEqual(@as(usize, 1), parsed_query.nb_bind_markers);
+
+        const bind_marker = parsed_query.bind_markers[0];
+        try testing.expectEqual(tc.expected_marker.id_type, bind_marker.id_type);
     }
 }
